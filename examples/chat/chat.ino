@@ -33,8 +33,8 @@
 #define I2S_SLOT_MASK I2S_STD_SLOT_LEFT
 
 // WiFi settings
-const char* ssid     = "your-wifi-ssid";
-const char* password = "your-wifi-password";
+const char* ssid     = "zh";
+const char* password = "66666666";
 
 
 
@@ -47,8 +47,8 @@ Audio audio;
 
 // Option 2: Use custom API key and URL (uncomment if using custom configuration)
 //OpenAI apiBaseUrl : "https://api.openai.com"
-const char* apiKey = "your-api-key";
-const char* apiBaseUrl = "https://api.openai.com";
+const char* apiKey = "sk-KkEHJ5tO1iiYIqr1jOmrH6FV2uagIICwzL0PDWarGIoHe3Zm";
+const char* apiBaseUrl = "https://api.chatanywhere.tech";
 ArduinoGPTChat gptChat(apiKey, apiBaseUrl);
 
 // System prompt configuration (modify as needed)
