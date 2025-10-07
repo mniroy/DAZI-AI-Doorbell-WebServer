@@ -194,6 +194,13 @@ void setup() {
     asrChat.setSilenceDuration(1000);  // 1 second silence detection
     asrChat.setMaxRecordingSeconds(50);
 
+    // Set timeout no speech callback - exit continuous mode if timeout without speech
+    asrChat.setTimeoutNoSpeechCallback([]() {
+      if (continuousMode) {
+        stopContinuousMode();
+      }
+    });
+
     // Connect to ByteDance ASR WebSocket
     if (!asrChat.connectWebSocket()) {
       Serial.println("Failed to connect to ASR service!");

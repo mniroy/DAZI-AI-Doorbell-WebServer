@@ -311,8 +311,17 @@ void ArduinoASRChat::processAudioSending() {
 void ArduinoASRChat::checkRecordingTimeout() {
   // Check max duration
   if (millis() - _recordingStartTime > _maxSeconds * 1000) {
-    Serial.println("\nMax duration reached, stopping");
-    stopRecording();
+    Serial.println("\nMax duration reached");
+
+    // If no speech detected and callback is set, trigger timeout callback
+    if (!_hasSpeech && _timeoutNoSpeechCallback != nullptr) {
+      Serial.println("No speech detected during recording, exiting continuous mode");
+      stopRecording();
+      _timeoutNoSpeechCallback();
+    } else {
+      Serial.println("Stopping recording");
+      stopRecording();
+    }
   }
 }
 
@@ -341,6 +350,10 @@ void ArduinoASRChat::clearResult() {
 
 void ArduinoASRChat::setResultCallback(ResultCallback callback) {
   _resultCallback = callback;
+}
+
+void ArduinoASRChat::setTimeoutNoSpeechCallback(TimeoutNoSpeechCallback callback) {
+  _timeoutNoSpeechCallback = callback;
 }
 
 void ArduinoASRChat::sendFullRequest() {

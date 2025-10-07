@@ -63,6 +63,10 @@ class ArduinoASRChat {
     typedef void (*ResultCallback)(String text);
     void setResultCallback(ResultCallback callback);
 
+    // Timeout without speech callback
+    typedef void (*TimeoutNoSpeechCallback)();
+    void setTimeoutNoSpeechCallback(TimeoutNoSpeechCallback callback);
+
   private:
     // WebSocket configuration
     const char* _apiKey;
@@ -109,6 +113,7 @@ class ArduinoASRChat {
 
     // Callback
     ResultCallback _resultCallback = nullptr;
+    TimeoutNoSpeechCallback _timeoutNoSpeechCallback = nullptr;
 
     // Private helper methods
     String generateWebSocketKey();
