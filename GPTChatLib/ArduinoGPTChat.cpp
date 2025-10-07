@@ -450,6 +450,18 @@ void ArduinoGPTChat::setSystemPrompt(const char* systemPrompt) {
   }
 }
 
+void ArduinoGPTChat::enableMemory(bool enable) {
+  _memoryEnabled = enable;
+  if (!enable) {
+    clearMemory();
+  }
+}
+
+void ArduinoGPTChat::clearMemory() {
+  _conversationHistory.clear();
+  Serial.println("Conversation memory cleared");
+}
+
 void ArduinoGPTChat::_updateApiUrls() {
   _apiUrl = _apiBaseUrl + "/v1/chat/completions";
   _ttsApiUrl = _apiBaseUrl + "/v1/audio/speech";
@@ -476,16 +488,37 @@ String ArduinoGPTChat::sendMessage(String message) {
 
   if (httpResponseCode == 200) {
     String response = http.getString();
-    return _processResponse(response);
+    String assistantResponse = _processResponse(response);
+
+    // Save to conversation history if memory is enabled
+    if (_memoryEnabled && assistantResponse.length() > 0) {
+      _conversationHistory.push_back(std::make_pair(message, assistantResponse));
+
+      // Keep only the last N pairs to avoid memory overflow
+      while (_conversationHistory.size() > _maxHistoryPairs) {
+        _conversationHistory.erase(_conversationHistory.begin());
+      }
+
+      Serial.printf("Memory: %d/%d conversation pairs stored\n",
+                    _conversationHistory.size(), _maxHistoryPairs);
+    }
+
+    return assistantResponse;
   }
   return "";
 }
 
 String ArduinoGPTChat::_buildPayload(String message) {
-  DynamicJsonDocument doc(768);
+  // Calculate required buffer size based on history
+  size_t bufferSize = 768;
+  if (_memoryEnabled && _conversationHistory.size() > 0) {
+    bufferSize = 768 + (_conversationHistory.size() * 512);  // Extra space for history
+  }
+
+  DynamicJsonDocument doc(bufferSize);
   doc["model"] = "gpt-4.1-nano";
   JsonArray messages = doc.createNestedArray("messages");
-  
+
   // Add system message if configured
   if (_systemPrompt.length() > 0) {
     JsonObject sysMsg = messages.createNestedObject();
@@ -493,7 +526,22 @@ String ArduinoGPTChat::_buildPayload(String message) {
     sysMsg["content"] = _systemPrompt;
   }
 
-  // Add user message
+  // Add conversation history if memory is enabled
+  if (_memoryEnabled) {
+    for (size_t i = 0; i < _conversationHistory.size(); i++) {
+      // Add user message from history
+      JsonObject historyUserMsg = messages.createNestedObject();
+      historyUserMsg["role"] = "user";
+      historyUserMsg["content"] = _conversationHistory[i].first;
+
+      // Add assistant message from history
+      JsonObject historyAssistantMsg = messages.createNestedObject();
+      historyAssistantMsg["role"] = "assistant";
+      historyAssistantMsg["content"] = _conversationHistory[i].second;
+    }
+  }
+
+  // Add current user message
   JsonObject userMsg = messages.createNestedObject();
   userMsg["role"] = "user";
   userMsg["content"] = message;

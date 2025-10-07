@@ -15,6 +15,8 @@ class ArduinoGPTChat {
     ArduinoGPTChat(const char* apiKey = nullptr, const char* apiBaseUrl = nullptr);
     void setApiConfig(const char* apiKey = nullptr, const char* apiBaseUrl = nullptr);
     void setSystemPrompt(const char* systemPrompt);
+    void enableMemory(bool enable);
+    void clearMemory();
     String sendMessage(String message);
     bool textToSpeech(String text);
     String speechToText(const char* audioFilePath);
@@ -45,6 +47,11 @@ class ArduinoGPTChat {
     String _buildTTSPayload(String text);
     String _buildMultipartForm(const char* audioFilePath, String boundary);
     void _updateApiUrls();
+
+    // Conversation memory
+    bool _memoryEnabled = false;
+    std::vector<std::pair<String, String>> _conversationHistory;  // pair<user_msg, assistant_msg>
+    const int _maxHistoryPairs = 5;  // Maximum conversation pairs to keep
 
     // WAV file handling
     uint8_t* createWAVBuffer(int16_t* samples, size_t numSamples);
