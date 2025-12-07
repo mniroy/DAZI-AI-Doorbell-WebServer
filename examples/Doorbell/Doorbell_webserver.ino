@@ -15,10 +15,10 @@
 
 // Hardware Pin Definitions
 #define I2S_DOUT 47
-#define I2S_BCLK 48
+#define I2S_BCLK 46
 #define I2S_LRC 45
 
-#define I2S_MIC_SERIAL_CLOCK 5     // SCK
+#define I2S_MIC_SERIAL_CLOCK 5      // SCK
 #define I2S_MIC_LEFT_RIGHT_CLOCK 4 // WS
 #define I2S_MIC_SERIAL_DATA 6      // SD
 
@@ -42,11 +42,13 @@ Audio audio;
 String wifi_ssid, wifi_pass;
 String asr_key, asr_clust;
 String openai_key, openai_url, sys_prompt;
+String stream_url;
+int asr_max_duration; // NEW: Configurable Timeout
 
 // MQTT Variables
 String mqtt_server, mqtt_port, mqtt_user, mqtt_pass;
 String mqtt_topic_history; 
-String mqtt_topic_sub;   
+String mqtt_topic_sub;    
 
 // Web Logging Buffer & Chat State
 String webLogBuffer = "";
@@ -66,6 +68,9 @@ const char* default_prompt =
 "Selalu klasifikasikan pengunjung sebagai: kurir paket, kurir galon aqua, satpam, keluarga, atau tamu lain. "
 "Gunakan Bahasa Indonesia santai tapi sopan. Jawaban pendek: 1–2 kalimat, maksimal sekitar 25 kata.";
 
+// Default Stream URL
+const char* default_stream = "http://192.168.1.34:1984/stream.html?src=Doorbell";
+
 // State Machine
 enum ConversationState { STATE_IDLE, STATE_LISTENING, STATE_PROCESSING_LLM, STATE_PLAYING_TTS, STATE_WAIT_TTS_COMPLETE };
 ConversationState currentState = STATE_IDLE;
@@ -84,7 +89,7 @@ unsigned long lastMqttReconnectAttempt = 0;
 void sysLog(String msg) {
   // Disabled Serial.print to prevent hanging if USB is disconnected on S3
   // if (Serial) Serial.print(msg); 
-  
+   
   webLogBuffer += msg; 
   if (webLogBuffer.length() > 4000) {
     webLogBuffer = webLogBuffer.substring(webLogBuffer.length() - 2000);
@@ -155,7 +160,7 @@ void setupMQTT() {
 
 boolean reconnectMQTT() {
   if (mqtt_server.length() == 0) return false;
-  
+   
   // Ensure WiFi is up
   if (WiFi.status() != WL_CONNECTED) {
     sysLogLn("[WiFi] Connection lost. Reconnecting WiFi...");
@@ -184,10 +189,10 @@ bool publishToTopic(String topic, String message) {
        return false;
     }
   }
-  
+   
   // 2. Stabilize
   mqttClient.loop();
-  
+   
   // 3. Publish
   if (mqttClient.publish(topic.c_str(), message.c_str())) {
     return true;
@@ -211,14 +216,16 @@ const char* html_template = R"rawliteral(
   :root {
     --bg-body: #f2f2f2; --bg-card: #ffffff; --text-main: #333333; --text-label: #555555;
     --input-bg: #ffffff; --input-border: #ddd; --heading-color: #007bff; --divider-color: #eee;
-    --chat-guest-bg: #e3f2fd; --chat-guest-border: #bbdefb;
-    --chat-ai-bg: #e8f5e9; --chat-ai-border: #c8e6c9;
+    --chat-guest-bg: #007bff; --chat-guest-text: #ffffff;
+    --chat-ai-bg: #f1f0f0; --chat-ai-text: #333333;
+    --chat-sys-bg: #e9ecef; --chat-sys-text: #6c757d;
   }
   body.dark-mode {
     --bg-body: #121212; --bg-card: #1e1e1e; --text-main: #e0e0e0; --text-label: #bbbbbb;
     --input-bg: #2d2d2d; --input-border: #444; --heading-color: #4dabf7; --divider-color: #333;
-    --chat-guest-bg: #152b39; --chat-guest-border: #1e455e;
-    --chat-ai-bg: #16301b; --chat-ai-border: #234d2a;
+    --chat-guest-bg: #0d6efd; --chat-guest-text: #ffffff;
+    --chat-ai-bg: #333333; --chat-ai-text: #e0e0e0;
+    --chat-sys-bg: #343a40; --chat-sys-text: #adb5bd;
   }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg-body); color: var(--text-main); padding: 20px; margin: 0; transition: background 0.3s, color 0.3s; }
   .container { display: flex; flex-wrap: wrap; gap: 20px; max-width: 1000px; margin: 0 auto; }
@@ -228,23 +235,137 @@ const char* html_template = R"rawliteral(
   .card { background: var(--bg-card); flex: 1; min-width: 300px; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; flex-direction: column; transition: background 0.3s; }
   h2 { color: var(--heading-color); margin-top: 0; margin-bottom: 20px; border-bottom: 2px solid var(--divider-color); padding-bottom: 10px; }
   label { font-weight: bold; display: block; margin-top: 15px; font-size: 13px; color: var(--text-label); }
-  input[type=text], input[type=password], textarea { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid var(--input-border); background: var(--input-bg); color: var(--text-main); border-radius: 5px; box-sizing: border-box; font-size: 14px; }
+  input[type=text], input[type=password], input[type=number], textarea { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid var(--input-border); background: var(--input-bg); color: var(--text-main); border-radius: 5px; box-sizing: border-box; font-size: 14px; }
   input:focus, textarea:focus { border-color: var(--heading-color); outline: none; }
   textarea.config { height: 150px; font-family: 'Courier New', monospace; font-size: 12px; line-height: 1.4; }
   button.save-btn { width: 100%; background-color: var(--heading-color); color: white; padding: 12px; border: none; border-radius: 5px; cursor: pointer; margin-top: 20px; font-size: 16px; font-weight: bold; }
+   
+  /* Chat Window Styling */
+  .chat-container {
+      height: 350px;
+      overflow-y: auto;
+      background: var(--bg-card);
+      border: 1px solid var(--input-border);
+      border-radius: 8px;
+      padding: 15px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      margin-bottom: 15px;
+  }
+  .msg { display: flex; width: 100%; }
+  .msg.guest { justify-content: flex-end; }
+  .msg.ai { justify-content: flex-start; }
+  .msg.system { justify-content: center; margin: 5px 0; }
   
-  .chat-window { padding: 15px; border-radius: 8px; margin-bottom: 10px; border: 1px solid transparent; }
-  .chat-guest { background-color: var(--chat-guest-bg); border-color: var(--chat-guest-border); }
-  .chat-ai { background-color: var(--chat-ai-bg); border-color: var(--chat-ai-border); }
-  .chat-label { font-size: 11px; font-weight: bold; text-transform: uppercase; margin-bottom: 5px; opacity: 0.7; }
-  .chat-text { font-size: 16px; line-height: 1.4; font-weight: 500; }
+  .bubble {
+      max-width: 75%;
+      padding: 10px 15px;
+      border-radius: 18px;
+      font-size: 15px;
+      line-height: 1.4;
+      position: relative;
+      word-wrap: break-word;
+  }
+  .msg.guest .bubble {
+      background-color: var(--chat-guest-bg);
+      color: var(--chat-guest-text);
+      border-bottom-right-radius: 4px;
+  }
+  .msg.ai .bubble {
+      background-color: var(--chat-ai-bg);
+      color: var(--chat-ai-text);
+      border-bottom-left-radius: 4px;
+  }
+  .msg.system .bubble {
+      background-color: var(--chat-sys-bg);
+      color: var(--chat-sys-text);
+      border-radius: 20px;
+      font-size: 12px;
+      padding: 5px 15px;
+      font-weight: bold;
+      max-width: 90%;
+  }
   
-  #terminal { background-color: #1e1e1e; color: #00ff00; font-family: 'Courier New', monospace; padding: 15px; height: 300px; overflow-y: auto; border-radius: 5px; font-size: 13px; white-space: pre-wrap; line-height: 1.3; border: 1px solid var(--input-border); }
-  .clear-btn { background: #6c757d; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-size: 12px; margin-top: 10px; }
+  .chat-label-small { font-size: 10px; margin-bottom: 2px; opacity: 0.6; padding: 0 5px; }
+  .msg.guest .chat-label-small { text-align: right; }
+  
+  /* --- ANIMATIONS --- */
+  
+  /* 1. Listening Wave (Guest) */
+  .listening-wave {
+    display: inline-block;
+    position: relative;
+    width: 40px;
+    height: 15px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .listening-wave div {
+    background-color: #fff;
+    width: 6px;
+    height: 100%;
+    animation: wave 1.2s infinite ease-in-out;
+  }
+  .listening-wave div:nth-child(1) { animation-delay: -1.2s; }
+  .listening-wave div:nth-child(2) { animation-delay: -1.1s; }
+  .listening-wave div:nth-child(3) { animation-delay: -1.0s; }
+  @keyframes wave {
+    0%, 40%, 100% { transform: scaleY(0.4); }
+    20% { transform: scaleY(1.0); }
+  }
+
+  /* 2. Typing Dots (AI Thinking) */
+  .typing-dots {
+    display: inline-block;
+    width: 40px;
+  }
+  .typing-dots div {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background-color: var(--text-main);
+    animation: bounce 1.4s infinite ease-in-out both;
+    margin: 0 2px;
+  }
+  .typing-dots div:nth-child(1) { animation-delay: -0.32s; }
+  .typing-dots div:nth-child(2) { animation-delay: -0.16s; }
+  @keyframes bounce {
+    0%, 80%, 100% { transform: scale(0); }
+    40% { transform: scale(1.0); }
+  }
+
+  /* 3. Speaking Bars (AI Speaking) */
+  .speaking-bars {
+    display: flex;
+    align-items: center;
+    height: 15px;
+  }
+  .speaking-bars div {
+    background-color: var(--text-main);
+    width: 4px;
+    height: 100%;
+    margin: 0 2px;
+    animation: speak 0.8s infinite ease-in-out;
+  }
+  .speaking-bars div:nth-child(1) { animation-delay: 0.1s; }
+  .speaking-bars div:nth-child(2) { animation-delay: 0.2s; }
+  .speaking-bars div:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes speak {
+    0%, 100% { height: 4px; }
+    50% { height: 15px; }
+  }
+
+  #terminal { background-color: #1e1e1e; color: #00ff00; font-family: 'Courier New', monospace; padding: 15px; height: 150px; overflow-y: auto; border-radius: 5px; font-size: 11px; white-space: pre-wrap; line-height: 1.3; border: 1px solid var(--input-border); }
+  .clear-btn { background: #6c757d; color: white; border: none; padding: 6px 15px; border-radius: 4px; cursor: pointer; font-size: 12px; margin-top: 10px; }
   .toggle-btn { background: #28a745; color: white; border: none; padding: 6px 15px; border-radius: 20px; cursor: pointer; font-size: 13px; font-weight: bold; }
   .status-badge { display:inline-block; padding: 6px 12px; border-radius: 20px; background: #e9ecef; color: #495057; font-weight: bold; font-size: 12px; border: 1px solid #ced4da; }
   .status-badge.live { background: #d4edda; color: #155724; border-color: #c3e6cb; }
   .status-badge.live::before { content: "● "; color: #28a745; }
+  .stream-box { width: 100%; height: 0; padding-bottom: 56.25%; position: relative; background: #000; border-radius: 8px; margin-bottom: 15px; overflow: hidden; }
+  .stream-box iframe { position: absolute; top:0; left: 0; width: 100%; height: 100%; border: none; }
 </style>
 <script>
   function toggleTheme() {
@@ -254,14 +375,53 @@ const char* html_template = R"rawliteral(
     document.getElementById('theme-text').innerText = isDark ? 'Light Mode' : 'Dark Mode';
   }
 
+  let lastChatHTML = "";
+  let lastState = -1;
+
   setInterval(function() {
+    // Poll Logs
     fetch('/logs').then(r => r.text()).then(data => {
       var term = document.getElementById("terminal");
       if(term.innerHTML !== data) { term.innerHTML = data; term.scrollTop = term.scrollHeight; }
     });
+    
+    // Poll Conversation & State
     fetch('/conversation').then(r => r.json()).then(data => {
-      document.getElementById("txt-guest").innerText = data.user;
-      document.getElementById("txt-ai").innerText = data.ai;
+      const chatBox = document.getElementById("chat-container");
+      let html = "";
+      let history = data.history || [];
+      let state = data.state || 0; // 0=Idle, 1=Listening, 2=Thinking, 3=Speaking, 4=WaitTTS
+      
+      if (history.length === 0 && state === 0) {
+        html = '<div style="text-align:center; color:gray; font-size:13px; padding-top:20px;">No conversation yet.<br>Press "Toggle Talk" to start.</div>';
+      } else {
+          history.forEach(msg => {
+            if(msg.role === 'guest') {
+                 html += `<div class="msg guest"><div><div class="chat-label-small">Guest</div><div class="bubble">${msg.text}</div></div></div>`;
+            } else if(msg.role === 'ai') {
+                 html += `<div class="msg ai"><div><div class="chat-label-small">AI</div><div class="bubble">${msg.text}</div></div></div>`;
+            } else if(msg.role === 'system') {
+                 html += `<div class="msg system"><div class="bubble">${msg.text}</div></div>`;
+            }
+          });
+      }
+      
+      // Add Animation Bubble based on State
+      if (state === 1) { // Listening (Guest)
+         html += `<div class="msg guest"><div><div class="chat-label-small">Listening...</div><div class="bubble"><div class="listening-wave"><div></div><div></div><div></div></div></div></div></div>`;
+      } else if (state === 2) { // LLM Processing (AI)
+         html += `<div class="msg ai"><div><div class="chat-label-small">Thinking...</div><div class="bubble"><div class="typing-dots"><div></div><div></div><div></div></div></div></div></div>`;
+      } else if (state === 3 || state === 4) { // TTS (AI)
+         html += `<div class="msg ai"><div><div class="chat-label-small">Speaking...</div><div class="bubble"><div class="speaking-bars"><div></div><div></div><div></div></div></div></div></div>`;
+      }
+      
+      // Update DOM only if content changed
+      if(lastChatHTML !== html || lastState !== state) {
+          chatBox.innerHTML = html;
+          chatBox.scrollTop = chatBox.scrollHeight;
+          lastChatHTML = html;
+          lastState = state;
+      }
     });
   }, 1000);
 </script>
@@ -290,18 +450,22 @@ const char* html_template = R"rawliteral(
       <label>OpenAI Key</label><input type="password" name="apikey" id="apikey">
       <label>Base URL</label><input type="text" name="apiurl" id="apiurl">
       <label>System Prompt</label><textarea class="config" name="prompt" id="prompt"></textarea>
+      
+      <label>No Speech Timeout (sec)</label><input type="number" name="timeout" id="timeout">
 
-      <!-- MQTT SETTINGS (Bottom, Split) -->
+      <!-- MQTT & STREAM SETTINGS -->
       <div style="margin: 20px 0; border-top: 1px solid var(--divider-color);"></div>
-      <h3>MQTT Settings</h3>
+      <h3>IoT Settings</h3>
       <label>Broker IP/URL</label><input type="text" name="mqserver" id="mqserver">
       <label>Port (Default 1883)</label><input type="text" name="mqport" id="mqport">
       <label>Username (Optional)</label><input type="text" name="mquser" id="mquser">
       <label>Password (Optional)</label><input type="password" name="mqpass" id="mqpass">
       
-      <!-- UPDATED MQTT FIELDS -->
       <label>History Topic (JSON)</label><input type="text" name="mqpub_hist" id="mqpub_hist" placeholder="escher/doorbell/history">
       <label>Subscribe Topic</label><input type="text" name="mqsub" id="mqsub" placeholder="escher/doorbell/in">
+      
+      <label style="color:#28a745;">Camera Stream URL</label>
+      <input type="text" name="stream" id="stream">
       
       <button class="save-btn" type="submit">Save & Restart Device</button>
     </form>
@@ -310,19 +474,20 @@ const char* html_template = R"rawliteral(
   <!-- INTERACTION COLUMN -->
   <div class="card">
     <h2>Live Interaction</h2>
+    
+    <!-- STREAM WINDOW -->
+    <div class="stream-box">
+        <iframe src="STREAM_URL_PLACEHOLDER" allowfullscreen></iframe>
+    </div>
+
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
       <div class="status-badge live">System Active</div>
       <button class="toggle-btn" onclick="fetch('/toggle')">🎤 Toggle Talk</button>
     </div>
 
-    <div class="chat-window chat-guest">
-      <div class="chat-label">Guest Says</div>
-      <div class="chat-text" id="txt-guest">...</div>
-    </div>
-
-    <div class="chat-window chat-ai">
-      <div class="chat-label">AI Response</div>
-      <div class="chat-text" id="txt-ai">...</div>
+    <!-- NEW CHAT WINDOW -->
+    <div id="chat-container" class="chat-container">
+        <!-- Messages will be injected here via JS -->
     </div>
 
     <hr style="margin: 20px 0; border: 0; border-top: 1px solid var(--divider-color);">
@@ -348,14 +513,19 @@ void handleRoot() {
   html.replace("id=\"apiurl\">", "id=\"apiurl\" value=\"" + openai_url + "\">");
   html.replace("id=\"prompt\"></textarea>", "id=\"prompt\">" + sys_prompt + "</textarea>");
   
+  html.replace("id=\"timeout\">", "id=\"timeout\" value=\"" + String(asr_max_duration) + "\">");
+
   html.replace("id=\"mqserver\">", "id=\"mqserver\" value=\"" + mqtt_server + "\">");
   html.replace("id=\"mqport\">", "id=\"mqport\" value=\"" + mqtt_port + "\">");
   html.replace("id=\"mquser\">", "id=\"mquser\" value=\"" + mqtt_user + "\">");
   html.replace("id=\"mqpass\">", "id=\"mqpass\" value=\"" + mqtt_pass + "\">");
   
-  // Updated replacement for history topic
   html.replace("id=\"mqpub_hist\">", "id=\"mqpub_hist\" value=\"" + mqtt_topic_history + "\">");
   html.replace("id=\"mqsub\">", "id=\"mqsub\" value=\"" + mqtt_topic_sub + "\">");
+
+  // NEW: Stream URL Replacement
+  html.replace("id=\"stream\">", "id=\"stream\" value=\"" + stream_url + "\">");
+  html.replace("STREAM_URL_PLACEHOLDER", stream_url);
 
   server.send(200, "text/html", html);
 }
@@ -370,6 +540,11 @@ void handleSave() {
     preferences.putString("apiurl", server.arg("apiurl"));
     preferences.putString("prompt", server.arg("prompt"));
     
+    // NEW: Save Timeout
+    if (server.hasArg("timeout")) {
+      preferences.putInt("timeout", server.arg("timeout").toInt());
+    }
+
     preferences.putString("mqserver", server.arg("mqserver"));
     preferences.putString("mqport", server.arg("mqport"));
     preferences.putString("mquser", server.arg("mquser"));
@@ -377,6 +552,9 @@ void handleSave() {
     
     preferences.putString("mqpub_h", server.arg("mqpub_hist"));
     preferences.putString("mqsub", server.arg("mqsub"));
+
+    // NEW: Save Stream URL
+    preferences.putString("stream", server.arg("stream"));
     
     preferences.end(); 
     
@@ -391,12 +569,26 @@ void handleSave() {
 void handleLogs() { server.send(200, "text/plain", webLogBuffer); }
 void handleClearLogs() { webLogBuffer = ""; sysLogLn("--- Logs Cleared ---"); server.send(200, "text/plain", "Cleared"); }
 
+// UPDATED: Sends full history + CURRENT STATE
 void handleConversation() {
-  String json = "{";
-  json += "\"user\":\"" + jsonEscape(lastUserText) + "\",";
-  json += "\"ai\":\"" + jsonEscape(lastAIText) + "\"";
-  json += "}";
-  server.send(200, "application/json", json);
+  // sessionHistoryJSON accumulates as "[{...},{...},"
+  // We need to fix it to be valid JSON before sending
+  String safeJSON = sessionHistoryJSON;
+  
+  // If we are mid-conversation, it might end with a comma
+  if (safeJSON.endsWith(",")) {
+    safeJSON.remove(safeJSON.length() - 1);
+  }
+  
+  // Close the array if it isn't already closed
+  if (!safeJSON.endsWith("]")) {
+    safeJSON += "]";
+  }
+  
+  // Create object with history AND current state
+  String response = "{\"history\":" + safeJSON + ",\"state\":" + String(currentState) + "}";
+  
+  server.send(200, "application/json", response);
 }
 
 void handleToggle() {
@@ -435,6 +627,9 @@ void setup() {
   openai_url= preferences.getString("apiurl", "https://api.chatanywhere.tech");
   sys_prompt= preferences.getString("prompt", default_prompt);
   
+  // NEW: Load Timeout (Default 50s)
+  asr_max_duration = preferences.getInt("timeout", 50);
+
   mqtt_server = preferences.getString("mqserver", "");
   mqtt_port   = preferences.getString("mqport", "1883");
   mqtt_user   = preferences.getString("mquser", "");
@@ -444,7 +639,10 @@ void setup() {
   mqtt_topic_history = preferences.getString("mqpub_h", "escher/doorbell/history");
   if (mqtt_topic_history.length() == 0) mqtt_topic_history = "escher/doorbell/history";
 
-  mqtt_topic_sub   = preferences.getString("mqsub", "escher/doorbell/in");
+  mqtt_topic_sub    = preferences.getString("mqsub", "escher/doorbell/in");
+
+  // NEW: Load Stream URL
+  stream_url = preferences.getString("stream", default_stream);
 
   // WiFi
   WiFi.mode(WIFI_STA);
@@ -511,7 +709,7 @@ void setup() {
 
     asrChat->setAudioParams(SAMPLE_RATE, 16, 1);
     asrChat->setSilenceDuration(1000);
-    asrChat->setMaxRecordingSeconds(50);
+    asrChat->setMaxRecordingSeconds(asr_max_duration); // UPDATED
     
     asrChat->setTimeoutNoSpeechCallback([]() {
       if (continuousMode) stopContinuousMode();
@@ -579,13 +777,16 @@ void stopContinuousMode() {
   // 1. CLEANUP FIRST! (Free up RAM/CPU)
   if (asrChat && asrChat->isRecording()) asrChat->stopRecording();
   
-  // 2. Finalize JSON
+  // 2. Add System End Message
+  sessionHistoryJSON += "{\"role\":\"system\",\"text\":\"--- Session Ended ---\"},";
+
+  // 3. Finalize JSON
   if (sessionHistoryJSON.endsWith(",")) {
     sessionHistoryJSON.remove(sessionHistoryJSON.length() - 1); 
   }
   sessionHistoryJSON += "]";
   
-  // 3. Publish History with Robust Retry
+  // 4. Publish History with Robust Retry
   sysLogLn("[MQTT] Final History Size: " + String(sessionHistoryJSON.length()) + " bytes");
   sysLogLn("[MQTT] Topic: " + mqtt_topic_history); // CRITICAL DEBUG LOG
   
@@ -600,7 +801,7 @@ void stopContinuousMode() {
     
     if (reconnectMQTT()) {
         mqttClient.loop(); 
-        delay(200);       
+        delay(200);        
         
         if (publishToTopic(mqtt_topic_history, sessionHistoryJSON)) {
             sysLogLn("[MQTT] History SENT on retry.");
@@ -612,7 +813,7 @@ void stopContinuousMode() {
     }
   }
 
-  // 4. Send Status AFTER history (Add delay to prevent race condition)
+  // 5. Send Status AFTER history (Add delay to prevent race condition)
   delay(250); 
   mqttClient.loop();
   publishToTopic("escher/doorbell/status", "Stopped Listening");
@@ -631,6 +832,9 @@ void handleASRResult() {
     sysLogLn("\n[User]: " + transcribedText);
     lastUserText = transcribedText;
     
+    // UPDATED: Append Guest message IMMEDIATELY so it shows up while AI thinks
+    sessionHistoryJSON += "{\"role\":\"guest\",\"text\":\"" + jsonEscape(transcribedText) + "\"},";
+
     // Keep connection alive
     mqttClient.loop(); 
     delay(10); 
@@ -646,17 +850,8 @@ void handleASRResult() {
       sysLogLn(" " + response);
       lastAIText = response;
 
-      // ACCUMULATE HISTORY (Do not send yet)
-      String safeGuest = transcribedText;
-      safeGuest.replace("\"", "\\\"");
-      safeGuest.replace("\n", " ");
-      
-      String safeAI = response;
-      safeAI.replace("\"", "\\\""); 
-      safeAI.replace("\n", " ");
-
-      String turnJSON = "{\"user\":\"" + safeGuest + "\",\"ai\":\"" + safeAI + "\"},";
-      sessionHistoryJSON += turnJSON;
+      // UPDATED: Append AI message AFTER thinking
+      sessionHistoryJSON += "{\"role\":\"ai\",\"text\":\"" + jsonEscape(response) + "\"},";
 
       // Ensure we are still connected for the NEXT turn
       if (!mqttClient.connected()) {
