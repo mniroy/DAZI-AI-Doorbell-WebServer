@@ -22,11 +22,11 @@
 #define I2S_MIC_LEFT_RIGHT_CLOCK 4 // WS
 #define I2S_MIC_SERIAL_DATA 6      // SD
 
-// RGB LED (NeoPixel)
-#define RGB_LED_PIN 48 
-
 #define BOOT_BUTTON_PIN 0
 #define SAMPLE_RATE 16000
+
+// RGB LED (NeoPixel) - GPIO 48 is standard for ESP32-S3 DevKit
+#define RGB_LED_PIN 48 
 
 // Objects
 Preferences preferences;
@@ -42,18 +42,21 @@ Audio audio;
 String wifi_ssid, wifi_pass;
 String asr_key, asr_clust;
 String openai_key, openai_url, sys_prompt;
-String ai_intro; // NEW: Customizable Intro
 
 // MQTT Variables
 String mqtt_server, mqtt_port, mqtt_user, mqtt_pass;
-String mqtt_topic_guest; 
-String mqtt_topic_ai;    
+String mqtt_topic_history; 
 String mqtt_topic_sub;   
 
 // Web Logging Buffer & Chat State
 String webLogBuffer = "";
 String lastUserText = "(Waiting for guest...)";
 String lastAIText = "(Waiting for AI...)";
+String sessionHistoryJSON = "[]"; // Accumulates full conversation
+
+// Button Pulse State
+unsigned long mqttButtonPressTime = 0;
+bool mqttButtonActive = false;
 
 // Default System Prompt
 const char* default_prompt = 
@@ -62,9 +65,6 @@ const char* default_prompt =
 "Fokusmu: ajak ngobrol orang yang menekan bel, cari tahu mereka siapa dan apa keperluannya. "
 "Selalu klasifikasikan pengunjung sebagai: kurir paket, kurir galon aqua, satpam, keluarga, atau tamu lain. "
 "Gunakan Bahasa Indonesia santai tapi sopan. Jawaban pendek: 1–2 kalimat, maksimal sekitar 25 kata.";
-
-// Default Intro
-const char* default_intro = "Halo, saya AI Rumah Escher.";
 
 // State Machine
 enum ConversationState { STATE_IDLE, STATE_LISTENING, STATE_PROCESSING_LLM, STATE_PLAYING_TTS, STATE_WAIT_TTS_COMPLETE };
@@ -82,7 +82,9 @@ unsigned long lastMqttReconnectAttempt = 0;
 // ==========================================
 
 void sysLog(String msg) {
-  // if (Serial) Serial.print(msg); // Disabled to prevent hanging on S3
+  // Disabled Serial.print to prevent hanging if USB is disconnected on S3
+  // if (Serial) Serial.print(msg); 
+  
   webLogBuffer += msg; 
   if (webLogBuffer.length() > 4000) {
     webLogBuffer = webLogBuffer.substring(webLogBuffer.length() - 2000);
@@ -111,9 +113,10 @@ void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
 // ==========================================
 // FORWARD DECLARATIONS
 // ==========================================
-void startContinuousMode(bool playIntro);
+void startContinuousMode(bool isInitialTrigger = false); 
 void stopContinuousMode();
 void handleToggle();
+boolean reconnectMQTT();
 
 // ==========================================
 // MQTT FUNCTIONS
@@ -142,25 +145,55 @@ void setupMQTT() {
     if (port == 0) port = 1883; 
     mqttClient.setServer(mqtt_server.c_str(), port);
     mqttClient.setCallback(mqttCallback);
-    sysLogLn("MQTT Configured: " + mqtt_server + ":" + String(port));
+    
+    // Increase buffer size to handle large JSON payloads (Full History)
+    mqttClient.setBufferSize(8192); 
+    
+    sysLogLn("MQTT Configured: " + mqtt_server + ":" + String(port) + " (Buffer: 8192)");
   }
 }
 
 boolean reconnectMQTT() {
   if (mqtt_server.length() == 0) return false;
+  
+  // Ensure WiFi is up
+  if (WiFi.status() != WL_CONNECTED) {
+    sysLogLn("[WiFi] Connection lost. Reconnecting WiFi...");
+    WiFi.reconnect();
+    int w = 0;
+    while (WiFi.status() != WL_CONNECTED && w < 10) { delay(500); w++; }
+  }
+
+  // Try to connect
   if (mqttClient.connect("EscherDoorbell", mqtt_user.c_str(), mqtt_pass.c_str())) {
     sysLogLn("[MQTT] Connected");
     if (mqtt_topic_sub.length() > 0) {
       mqttClient.subscribe(mqtt_topic_sub.c_str());
-      sysLogLn("[MQTT] Subscribed to: " + mqtt_topic_sub);
     }
+    return true;
   }
-  return mqttClient.connected();
+  return false;
 }
 
-void publishToTopic(String topic, String message) {
-  if (mqttClient.connected() && topic.length() > 0) {
-    mqttClient.publish(topic.c_str(), message.c_str());
+bool publishToTopic(String topic, String message) {
+  // 1. Check/Restore Connection
+  if (!mqttClient.connected()) {
+    sysLogLn("[MQTT] Connecting...");
+    if (!reconnectMQTT()) {
+       sysLogLn("[MQTT ERROR] Reconnect failed.");
+       return false;
+    }
+  }
+  
+  // 2. Stabilize
+  mqttClient.loop();
+  
+  // 3. Publish
+  if (mqttClient.publish(topic.c_str(), message.c_str())) {
+    return true;
+  } else {
+    sysLogLn("[MQTT ERROR] Publish failed. Len: " + String(message.length()));
+    return false;
   }
 }
 
@@ -249,26 +282,25 @@ const char* html_template = R"rawliteral(
       <label>WiFi SSID</label><input type="text" name="ssid" id="ssid">
       <label>WiFi Password</label><input type="password" name="pass" id="pass">
       
+      <!-- AI SETTINGS (Top) -->
       <div style="margin: 20px 0; border-top: 1px solid var(--divider-color);"></div>
       <h3>AI Settings</h3>
       <label>ASR Key</label><input type="text" name="asrkey" id="asrkey">
       <label>ASR Cluster</label><input type="text" name="asrclus" id="asrclus">
       <label>OpenAI Key</label><input type="password" name="apikey" id="apikey">
       <label>Base URL</label><input type="text" name="apiurl" id="apiurl">
-      
-      <!-- INTRO SETTING (NEW) -->
-      <label>Intro Text (Played on first press)</label><textarea class="config" name="intro" id="intro" style="height:60px;"></textarea>
-      
       <label>System Prompt</label><textarea class="config" name="prompt" id="prompt"></textarea>
 
+      <!-- MQTT SETTINGS (Bottom, Split) -->
       <div style="margin: 20px 0; border-top: 1px solid var(--divider-color);"></div>
       <h3>MQTT Settings</h3>
       <label>Broker IP/URL</label><input type="text" name="mqserver" id="mqserver">
       <label>Port (Default 1883)</label><input type="text" name="mqport" id="mqport">
       <label>Username (Optional)</label><input type="text" name="mquser" id="mquser">
       <label>Password (Optional)</label><input type="password" name="mqpass" id="mqpass">
-      <label>Guest Text Topic</label><input type="text" name="mqpub_guest" id="mqpub_guest" placeholder="escher/doorbell/guest">
-      <label>AI Response Topic</label><input type="text" name="mqpub_ai" id="mqpub_ai" placeholder="escher/doorbell/ai">
+      
+      <!-- UPDATED MQTT FIELDS -->
+      <label>History Topic (JSON)</label><input type="text" name="mqpub_hist" id="mqpub_hist" placeholder="escher/doorbell/history">
       <label>Subscribe Topic</label><input type="text" name="mqsub" id="mqsub" placeholder="escher/doorbell/in">
       
       <button class="save-btn" type="submit">Save & Restart Device</button>
@@ -315,15 +347,14 @@ void handleRoot() {
   html.replace("id=\"apikey\">", "id=\"apikey\" value=\"" + openai_key + "\">");
   html.replace("id=\"apiurl\">", "id=\"apiurl\" value=\"" + openai_url + "\">");
   html.replace("id=\"prompt\"></textarea>", "id=\"prompt\">" + sys_prompt + "</textarea>");
-  // Inject Intro
-  html.replace("id=\"intro\"></textarea>", "id=\"intro\">" + ai_intro + "</textarea>");
   
   html.replace("id=\"mqserver\">", "id=\"mqserver\" value=\"" + mqtt_server + "\">");
   html.replace("id=\"mqport\">", "id=\"mqport\" value=\"" + mqtt_port + "\">");
   html.replace("id=\"mquser\">", "id=\"mquser\" value=\"" + mqtt_user + "\">");
   html.replace("id=\"mqpass\">", "id=\"mqpass\" value=\"" + mqtt_pass + "\">");
-  html.replace("id=\"mqpub_guest\">", "id=\"mqpub_guest\" value=\"" + mqtt_topic_guest + "\">");
-  html.replace("id=\"mqpub_ai\">", "id=\"mqpub_ai\" value=\"" + mqtt_topic_ai + "\">");
+  
+  // Updated replacement for history topic
+  html.replace("id=\"mqpub_hist\">", "id=\"mqpub_hist\" value=\"" + mqtt_topic_history + "\">");
   html.replace("id=\"mqsub\">", "id=\"mqsub\" value=\"" + mqtt_topic_sub + "\">");
 
   server.send(200, "text/html", html);
@@ -338,16 +369,16 @@ void handleSave() {
     preferences.putString("apikey", server.arg("apikey"));
     preferences.putString("apiurl", server.arg("apiurl"));
     preferences.putString("prompt", server.arg("prompt"));
-    // Save Intro
-    preferences.putString("intro", server.arg("intro"));
     
     preferences.putString("mqserver", server.arg("mqserver"));
     preferences.putString("mqport", server.arg("mqport"));
     preferences.putString("mquser", server.arg("mquser"));
     preferences.putString("mqpass", server.arg("mqpass"));
-    preferences.putString("mqpub_g", server.arg("mqpub_guest"));
-    preferences.putString("mqpub_a", server.arg("mqpub_ai"));
+    
+    preferences.putString("mqpub_h", server.arg("mqpub_hist"));
     preferences.putString("mqsub", server.arg("mqsub"));
+    
+    preferences.end(); 
     
     server.send(200, "text/html", "<body style='background:#121212;color:white;text-align:center;padding:50px;font-family:sans-serif;'><h1>Saved!</h1><p>Restarting...</p><a href='/'>Go Back</a></body>");
     delay(1000);
@@ -374,7 +405,7 @@ void handleToggle() {
     server.send(200, "text/plain", "Stopped");
   } else {
     if (currentState == STATE_IDLE) {
-      startContinuousMode(true); 
+      startContinuousMode(true); // Treat as initial trigger via UI
       server.send(200, "text/plain", "Started");
     } else {
       server.send(200, "text/plain", "Busy");
@@ -396,21 +427,23 @@ void setup() {
   // Load Settings
   preferences.begin("doorbell", false);
   
-  wifi_ssid = preferences.getString("ssid", "DefaultSSID");
-  wifi_pass = preferences.getString("pass", "DefaultPass");
-  asr_key   = preferences.getString("asrkey", "asr key to get from https://www.aisteb.com/");
-  asr_clust = preferences.getString("asrclus", "volcengine_input_id"); //_id for Bahasa Indonesia
-  openai_key= preferences.getString("apikey", "api key to get from https://www.aisteb.com/");
-  openai_url= preferences.getString("apiurl", "baseurl to get from https://www.aisteb.com/");
+  wifi_ssid = preferences.getString("ssid", "EscherHome_IoT");
+  wifi_pass = preferences.getString("pass", "1234567890");
+  asr_key   = preferences.getString("asrkey", "07fcb4a5-b7b2-45d8-864a-8cc0292380df");
+  asr_clust = preferences.getString("asrclus", "volcengine_input_id");
+  openai_key= preferences.getString("apikey", "sk-KkEHJ5tO1iiYIqr1jOmrH6FV2uagIICwzL0PDWarGIoHe3Zm");
+  openai_url= preferences.getString("apiurl", "https://api.chatanywhere.tech");
   sys_prompt= preferences.getString("prompt", default_prompt);
-  ai_intro  = preferences.getString("intro", default_intro); // Load Intro
   
   mqtt_server = preferences.getString("mqserver", "");
   mqtt_port   = preferences.getString("mqport", "1883");
   mqtt_user   = preferences.getString("mquser", "");
   mqtt_pass   = preferences.getString("mqpass", "");
-  mqtt_topic_guest = preferences.getString("mqpub_g", "escher/doorbell/guest");
-  mqtt_topic_ai    = preferences.getString("mqpub_a", "escher/doorbell/ai");
+  
+  // CRITICAL: Ensure we have a default topic if empty
+  mqtt_topic_history = preferences.getString("mqpub_h", "escher/doorbell/history");
+  if (mqtt_topic_history.length() == 0) mqtt_topic_history = "escher/doorbell/history";
+
   mqtt_topic_sub   = preferences.getString("mqsub", "escher/doorbell/in");
 
   // WiFi
@@ -496,31 +529,25 @@ void setup() {
 }
 
 // Logic
-void startContinuousMode(bool playIntro) {
+void startContinuousMode(bool isInitialTrigger) {
   if (isAPMode) return;
   continuousMode = true;
   
-  publishToTopic("escher/doorbell/button", "pressed");
-  sysLogLn("[MQTT] Doorbell Event: Pressed");
-
-  if (playIntro) {
-    sysLogLn("\n--- INTRO ---");
-    currentState = STATE_PLAYING_TTS;
-    setLedColor(0, 50, 0); // GREEN
+  if (isInitialTrigger) {
+    // Reset History on NEW session (physical press)
+    sessionHistoryJSON = "["; 
     
-    // Play the stored intro variable
-    if (gptChat->textToSpeech(ai_intro.c_str())) {
-      currentState = STATE_WAIT_TTS_COMPLETE;
-      ttsStartTime = millis();
-      ttsCheckTime = millis();
-      return; 
-    }
+    publishToTopic("escher/doorbell/button", "pressed");
+    sysLogLn("[MQTT] Doorbell Event: Pressed");
+    
+    mqttButtonActive = true;
+    mqttButtonPressTime = millis();
   }
 
   currentState = STATE_LISTENING;
   sysLogLn("\n--- START ---");
   sysLogLn("Listening...");
-  publishToTopic(mqtt_topic_guest, "Started Listening");
+  publishToTopic("escher/doorbell/status", "Started Listening");
   setLedColor(0, 0, 50); // BLUE
   
   if (asrChat && asrChat->startRecording()) {
@@ -548,8 +575,48 @@ void startContinuousMode(bool playIntro) {
 void stopContinuousMode() {
   continuousMode = false;
   sysLogLn("\n--- STOP ---");
-  publishToTopic("escher/doorbell/status", "Stopped Listening");
+  
+  // 1. CLEANUP FIRST! (Free up RAM/CPU)
   if (asrChat && asrChat->isRecording()) asrChat->stopRecording();
+  
+  // 2. Finalize JSON
+  if (sessionHistoryJSON.endsWith(",")) {
+    sessionHistoryJSON.remove(sessionHistoryJSON.length() - 1); 
+  }
+  sessionHistoryJSON += "]";
+  
+  // 3. Publish History with Robust Retry
+  sysLogLn("[MQTT] Final History Size: " + String(sessionHistoryJSON.length()) + " bytes");
+  sysLogLn("[MQTT] Topic: " + mqtt_topic_history); // CRITICAL DEBUG LOG
+  
+  // Attempt 1
+  if (publishToTopic(mqtt_topic_history, sessionHistoryJSON)) {
+    sysLogLn("[MQTT] History SENT successfully.");
+  } else {
+    // Attempt 2: Explicit Reconnect & Wait
+    sysLogLn("[MQTT WARN] First send failed. Forcing reconnect and retrying...");
+    mqttClient.disconnect();
+    delay(500); 
+    
+    if (reconnectMQTT()) {
+        mqttClient.loop(); 
+        delay(200);       
+        
+        if (publishToTopic(mqtt_topic_history, sessionHistoryJSON)) {
+            sysLogLn("[MQTT] History SENT on retry.");
+        } else {
+            sysLogLn("[MQTT ERROR] Failed on retry.");
+        }
+    } else {
+        sysLogLn("[MQTT ERROR] Could not reconnect for retry.");
+    }
+  }
+
+  // 4. Send Status AFTER history (Add delay to prevent race condition)
+  delay(250); 
+  mqttClient.loop();
+  publishToTopic("escher/doorbell/status", "Stopped Listening");
+
   currentState = STATE_IDLE;
   setLedColor(0, 0, 0); 
 }
@@ -563,18 +630,39 @@ void handleASRResult() {
   if (transcribedText.length() > 0) {
     sysLogLn("\n[User]: " + transcribedText);
     lastUserText = transcribedText;
-    publishToTopic(mqtt_topic_guest, transcribedText);
+    
+    // Keep connection alive
+    mqttClient.loop(); 
+    delay(10); 
 
     currentState = STATE_PROCESSING_LLM;
     sysLog("[AI]: Thinking...");
     setLedColor(0, 50, 0); // GREEN
     
+    // Blocking Call
     String response = gptChat->sendMessage(transcribedText);
     
     if (response.length() > 0) {
       sysLogLn(" " + response);
       lastAIText = response;
-      publishToTopic(mqtt_topic_ai, response);
+
+      // ACCUMULATE HISTORY (Do not send yet)
+      String safeGuest = transcribedText;
+      safeGuest.replace("\"", "\\\"");
+      safeGuest.replace("\n", " ");
+      
+      String safeAI = response;
+      safeAI.replace("\"", "\\\""); 
+      safeAI.replace("\n", " ");
+
+      String turnJSON = "{\"user\":\"" + safeGuest + "\",\"ai\":\"" + safeAI + "\"},";
+      sessionHistoryJSON += turnJSON;
+
+      // Ensure we are still connected for the NEXT turn
+      if (!mqttClient.connected()) {
+        reconnectMQTT();
+      }
+      mqttClient.loop(); 
 
       currentState = STATE_PLAYING_TTS;
       sysLog("[TTS]: Speaking...");
@@ -606,6 +694,12 @@ void loop() {
   if (isAPMode) return;
 
   audio.loop();
+  
+  if (mqttButtonActive && (millis() - mqttButtonPressTime > 1000)) {
+    publishToTopic("escher/doorbell/button", "released");
+    sysLogLn("[MQTT] Doorbell Event: Released (Auto-reset)");
+    mqttButtonActive = false;
+  }
   
   if (mqtt_server.length() > 0) {
     if (!mqttClient.connected()) {
@@ -653,6 +747,8 @@ void loop() {
           } else {
             currentState = STATE_IDLE;
             setLedColor(0, 0, 0); 
+            // Also call stopContinuousMode here to ensure history is sent if conversation ends naturally
+            stopContinuousMode(); 
           }
         }
       }
