@@ -1,19 +1,19 @@
 #include "ArduinoASRChat.h"
 
-ArduinoASRChat::ArduinoASRChat(const char* apiKey, const char* cluster) {
+ArduinoASRChat::ArduinoASRChat(const char* apiKey, const char* modelId) {
   _apiKey = apiKey;
-  _cluster = cluster;
+  _modelId = modelId;
 
   // Allocate send buffer
   _sendBuffer = new int16_t[_sendBatchSize / 2];
 }
 
-void ArduinoASRChat::setApiConfig(const char* apiKey, const char* cluster) {
+void ArduinoASRChat::setApiConfig(const char* apiKey, const char* modelId) {
   if (apiKey != nullptr) {
     _apiKey = apiKey;
   }
-  if (cluster != nullptr) {
-    _cluster = cluster;
+  if (modelId != nullptr) {
+    _modelId = modelId;
   }
 }
 
@@ -89,7 +89,7 @@ String ArduinoASRChat::generateWebSocketKey() {
 }
 
 bool ArduinoASRChat::connectWebSocket() {
-  Serial.println("Connecting WebSocket...");
+  Serial.println("Connecting to ElevenLabs WebSocket...");
 
   _client.setInsecure();
 
@@ -101,15 +101,19 @@ bool ArduinoASRChat::connectWebSocket() {
   // Disable Nagle algorithm for immediate send
   _client.setNoDelay(true);
 
+  // Construct Path with Model ID (defaulting to scribe_v2 if not set)
+  String modelParam = (_modelId != nullptr && strlen(_modelId) > 0) ? _modelId : "scribe_v2";
+  String fullPath = String(_wsPath) + "?model_id=" + modelParam;
+
   // Generate WebSocket Key and send handshake request
   String ws_key = generateWebSocketKey();
-  String request = String("GET ") + _wsPath + " HTTP/1.1\r\n";
+  String request = String("GET ") + fullPath + " HTTP/1.1\r\n";
   request += String("Host: ") + _wsHost + "\r\n";
   request += "Upgrade: websocket\r\n";
   request += "Connection: Upgrade\r\n";
   request += "Sec-WebSocket-Key: " + ws_key + "\r\n";
   request += "Sec-WebSocket-Version: 13\r\n";
-  request += String("x-api-key: ") + _apiKey + "\r\n";
+  request += String("xi-api-key: ") + _apiKey + "\r\n"; // ElevenLabs Auth Header
   request += "\r\n";
 
   _client.print(request);
@@ -137,9 +141,8 @@ bool ArduinoASRChat::connectWebSocket() {
 
   // Check response
   if (response.indexOf("101") >= 0 && response.indexOf("Switching Protocols") >= 0) {
-    Serial.println("WebSocket connected");
+    Serial.println("WebSocket connected to ElevenLabs");
     _wsConnected = true;
-    _endMarkerSent = false;  // Reset flag on new connection
     return true;
   } else {
     Serial.println("WebSocket handshake failed");
@@ -162,21 +165,11 @@ bool ArduinoASRChat::isWebSocketConnected() {
 }
 
 bool ArduinoASRChat::startRecording() {
-  // If end marker was sent, need to reconnect WebSocket
-  if (_endMarkerSent) {
-    Serial.println("Reconnecting WebSocket for new session...");
-    disconnectWebSocket();
-    delay(100);
-    if (!connectWebSocket()) {
-      Serial.println("Failed to reconnect WebSocket!");
-      return false;
-    }
-    _endMarkerSent = false;
-  }
-
   if (!_wsConnected) {
     Serial.println("WebSocket not connected!");
-    return false;
+    if (!connectWebSocket()) {
+        return false;
+    }
   }
 
   if (_isRecording) {
@@ -185,7 +178,7 @@ bool ArduinoASRChat::startRecording() {
   }
 
   Serial.println("\n========================================");
-  Serial.println("Recording started...");
+  Serial.println("ElevenLabs Recording started...");
   Serial.println("========================================");
 
   _isRecording = true;
@@ -200,10 +193,9 @@ bool ArduinoASRChat::startRecording() {
   _sameResultCount = 0;
   _lastDotTime = millis();
 
-  // 发送新的会话请求，开始新的识别会话
-  sendFullRequest();
-  delay(50);  // 等待服务器确认
-
+  // Send initial configuration frame
+  sendStartConfig();
+  
   return true;
 }
 
@@ -229,13 +221,16 @@ void ArduinoASRChat::stopRecording() {
   _recognizedText = _lastResultText;
   _hasNewResult = true;
 
+  // Send End of Stream JSON
   sendEndMarker();
-  _endMarkerSent = true;  // Mark that end marker has been sent
 
   // Trigger callback if set
   if (_resultCallback != nullptr && _recognizedText.length() > 0) {
     _resultCallback(_recognizedText);
   }
+  
+  // Clean disconnect after session
+  disconnectWebSocket();
 }
 
 bool ArduinoASRChat::isRecording() {
@@ -264,16 +259,7 @@ void ArduinoASRChat::loop() {
 
   // Process received data
   if (_client.available()) {
-    if (_isRecording) {
-      // Process only one message to avoid blocking too long
-      handleWebSocketData();
-    } else {
-      // Process all pending responses after recording
-      while (_client.available()) {
-        handleWebSocketData();
-        delay(10);
-      }
-    }
+     handleWebSocketData();
   }
 }
 
@@ -285,7 +271,6 @@ void ArduinoASRChat::processAudioSending() {
   }
 
   // Read audio samples in a tight loop to keep up with I2S data rate
-  // Must read fast enough to avoid buffer overflow and send data on time
   for (int i = 0; i < _samplesPerRead; i++) {
     if (!_I2S.available()) {
       break;  // No more data available
@@ -356,79 +341,42 @@ void ArduinoASRChat::setTimeoutNoSpeechCallback(TimeoutNoSpeechCallback callback
   _timeoutNoSpeechCallback = callback;
 }
 
-void ArduinoASRChat::sendFullRequest() {
-  // Generate unique session ID using timestamp + random
-  String reqid = String(millis()) + "_" + String(random(10000, 99999));
-
-  // Use MAC address as stable user ID
-  String uid = String(ESP.getEfuseMac(), HEX);
-
-  StaticJsonDocument<512> doc;
-  doc["app"]["cluster"] = _cluster;
-  doc["user"]["uid"] = uid;
-  doc["request"]["reqid"] = reqid;
-  doc["request"]["nbest"] = 1;
-  doc["request"]["workflow"] = "audio_in,resample,partition,vad,fe,decode,itn,nlu_punctuate";
-  doc["request"]["result_type"] = "full";
-  doc["request"]["sequence"] = 1;
-  doc["audio"]["format"] = "raw";
-  doc["audio"]["rate"] = _sampleRate;
-  doc["audio"]["bits"] = _bitsPerSample;
-  doc["audio"]["channel"] = _channels;
-  doc["audio"]["codec"] = "raw";
-
-  String json_str;
-  serializeJson(doc, json_str);
-
-  Serial.print("Request ID: ");
-  Serial.println(reqid);
-  Serial.println("Sending config:");
-  Serial.println(json_str);
-
-  // Protocol header
-  uint8_t header[4] = {0x11, (CLIENT_FULL_REQUEST << 4) | NO_SEQUENCE, 0x10, 0x00};
-  uint32_t payload_len = json_str.length();
-  uint8_t len_bytes[4];
-  len_bytes[0] = (payload_len >> 24) & 0xFF;
-  len_bytes[1] = (payload_len >> 16) & 0xFF;
-  len_bytes[2] = (payload_len >> 8) & 0xFF;
-  len_bytes[3] = payload_len & 0xFF;
-
-  uint8_t* full_request = new uint8_t[8 + payload_len];
-  memcpy(full_request, header, 4);
-  memcpy(full_request + 4, len_bytes, 4);
-  memcpy(full_request + 8, json_str.c_str(), payload_len);
-
-  sendWebSocketFrame(full_request, 8 + payload_len, 0x02);
-  delete[] full_request;
+void ArduinoASRChat::sendStartConfig() {
+    StaticJsonDocument<256> doc;
+    doc["type"] = "start";
+    
+    String json_str;
+    serializeJson(doc, json_str);
+    // Send as Text Frame (0x01)
+    sendWebSocketFrame((uint8_t*)json_str.c_str(), json_str.length(), 0x01);
 }
 
 void ArduinoASRChat::sendAudioChunk(uint8_t* data, size_t len) {
-  // Protocol header
-  uint8_t header[4] = {0x11, (CLIENT_AUDIO_ONLY_REQUEST << 4) | NO_SEQUENCE, 0x10, 0x00};
-  uint8_t len_bytes[4];
-  len_bytes[0] = (len >> 24) & 0xFF;
-  len_bytes[1] = (len >> 16) & 0xFF;
-  len_bytes[2] = (len >> 8) & 0xFF;
-  len_bytes[3] = len & 0xFF;
+  // 1. Encode Audio to Base64
+  size_t output_len;
+  size_t base64_len = ((len + 2) / 3) * 4 + 1; // Approximation
+  unsigned char* base64_output = new unsigned char[base64_len];
+  
+  mbedtls_base64_encode(base64_output, base64_len, &output_len, data, len);
+  base64_output[output_len] = 0; // Null terminate
 
-  uint8_t* audio_request = new uint8_t[8 + len];
-  memcpy(audio_request, header, 4);
-  memcpy(audio_request + 4, len_bytes, 4);
-  memcpy(audio_request + 8, data, len);
+  // 2. Wrap in JSON
+  // Standard ElevenLabs pattern: {"audio_event": "audio_chunk", "audio_base_64": "..."}
+  // Using manual string building to save JSON overhead in critical loop
+  String json_payload = "{\"audio_event\":\"audio_chunk\",\"audio_base_64\":\"";
+  json_payload += (char*)base64_output;
+  json_payload += "\"}";
 
-  sendWebSocketFrame(audio_request, 8 + len, 0x02);
-  delete[] audio_request;
+  // 3. Send as Text Frame
+  sendWebSocketFrame((uint8_t*)json_payload.c_str(), json_payload.length(), 0x01); // 0x01 = Text Frame
+
+  delete[] base64_output;
 }
 
 void ArduinoASRChat::sendEndMarker() {
-  uint8_t header[4] = {0x11, (CLIENT_AUDIO_ONLY_REQUEST << 4) | NEG_SEQUENCE, 0x10, 0x00};
-  uint8_t len_bytes[4] = {0x00, 0x00, 0x00, 0x00};
-  uint8_t end_request[8];
-  memcpy(end_request, header, 4);
-  memcpy(end_request + 4, len_bytes, 4);
-
-  sendWebSocketFrame(end_request, 8, 0x02);
+  // Send End of Stream JSON (empty chunk)
+  String eos = "{\"audio_event\":\"audio_chunk\",\"audio_base_64\":\"\"}"; 
+  sendWebSocketFrame((uint8_t*)eos.c_str(), eos.length(), 0x01);
   Serial.println("End marker sent");
 }
 
@@ -444,8 +392,8 @@ void ArduinoASRChat::sendWebSocketFrame(uint8_t* data, size_t len, uint8_t opcod
   uint8_t header[10];
   int header_len = 2;
 
-  header[0] = 0x80 | opcode;
-  header[1] = 0x80;
+  header[0] = 0x80 | opcode; // FIN bit set
+  header[1] = 0x80; // Mask bit set
 
   // Length
   if (len < 126) {
@@ -515,19 +463,21 @@ void ArduinoASRChat::handleWebSocketData() {
 
   // Read payload
   if (payload_len > 0 && payload_len < 100000) {
-    uint8_t* payload = new uint8_t[payload_len];
+    uint8_t* payload = new uint8_t[payload_len + 1];
     size_t bytes_read = _client.readBytes(payload, payload_len);
 
     if (bytes_read == payload_len) {
-      // Unmask
+      payload[payload_len] = 0; // Null terminate
+      
+      // Unmask if needed
       if (masked) {
         for (size_t i = 0; i < payload_len; i++) {
           payload[i] ^= mask_key[i % 4];
         }
       }
 
-      // Handle different opcodes
-      if (opcode == 0x01 || opcode == 0x02) {
+      // Handle Text Frames (JSON)
+      if (opcode == 0x01) { 
         parseResponse(payload, payload_len);
       } else if (opcode == 0x08) {
         Serial.println("Server closed connection");
@@ -543,53 +493,21 @@ void ArduinoASRChat::handleWebSocketData() {
 }
 
 void ArduinoASRChat::parseResponse(uint8_t* data, size_t len) {
-  if (len < 4) return;
-
-  uint8_t msg_type = data[1] >> 4;
-  uint8_t header_size = data[0] & 0x0f;
-
-  if (len < header_size * 4) return;
-
-  uint8_t* payload = data + header_size * 4;
-  size_t payload_len = len - header_size * 4;
-
-  if (msg_type == SERVER_FULL_RESPONSE && payload_len > 4) {
-    payload += 4;
-    payload_len -= 4;
-  } else if (msg_type == SERVER_ACK && payload_len >= 8) {
-    payload += 8;
-    payload_len -= 8;
-  } else if (msg_type == SERVER_ERROR_RESPONSE && payload_len >= 8) {
-    payload += 8;
-    payload_len -= 8;
-  }
-
   StaticJsonDocument<2048> doc;
-  DeserializationError error = deserializeJson(doc, payload, payload_len);
+  DeserializationError error = deserializeJson(doc, (char*)data);
 
   if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.f_str());
     return;
   }
 
-  if (doc.containsKey("code")) {
-    int code = doc["code"];
-    if (code != 1000 && code != 1013) {
-      // Ignore 1000 (success) and 1013 (silence detection)
-      Serial.print("\nError: ");
-      serializeJson(doc, Serial);
-      Serial.println();
-    }
-  }
-
-  if (doc.containsKey("result")) {
-    JsonVariant result = doc["result"];
-    String current_text = "";
-
-    if (result.is<JsonArray>() && result.size() > 0) {
-      if (result[0].containsKey("text")) {
-        current_text = result[0]["text"].as<String>();
-      }
-    }
+  // Handle ElevenLabs Response Structure
+  if (doc.containsKey("text")) {
+    const char* text = doc["text"];
+    String current_text = String(text);
+    // ElevenLabs sends "is_final" boolean
+    bool is_final = doc["is_final"] | false; 
 
     if (current_text.length() > 0 && current_text != " ") {
       if (!_hasSpeech) {
@@ -599,24 +517,20 @@ void ArduinoASRChat::parseResponse(uint8_t* data, size_t len) {
 
       // Update last speech time
       _lastSpeechTime = millis();
+      _lastResultText = current_text;
+      
+      Serial.printf("Recognizing: %s\n", current_text.c_str());
 
-      if (current_text == _lastResultText) {
-        _sameResultCount++;
-        if (_sameResultCount <= 3) {
-          Serial.printf("Recognizing: %s\n", current_text.c_str());
-        } else if (_sameResultCount == 4) {
-          Serial.printf("Result stable: %s\n", current_text.c_str());
-        }
-
-        // Only trigger stop if still recording
-        if (_sameResultCount >= 10 && _isRecording && !_shouldStop) {
-          Serial.println("\nResult stable, stopping recording");
-          stopRecording();
-        }
-      } else {
-        _sameResultCount = 1;
-        _lastResultText = current_text;
-        Serial.printf("Recognizing: %s\n", current_text.c_str());
+      // If ElevenLabs says it's final, we trust it
+      if (is_final) {
+          Serial.printf("Final Phrase: %s\n", current_text.c_str());
+          _recognizedText = current_text; 
+          _hasNewResult = true;
+          
+          if (_isRecording && !_shouldStop) {
+             Serial.println("Received final result, stopping.");
+             stopRecording();
+          }
       }
     }
   }
