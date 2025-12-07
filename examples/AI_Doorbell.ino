@@ -5,11 +5,9 @@
 #include <ArduinoGPTChat.h>
 #include <PubSubClient.h>
 #include "Audio.h"
-
-// Included refactored files
-#include "src/config.h"
-#include "src/web_index.h"
-#include "src/utils.h"
+#include "config.h"
+#include "web_index.h"
+#include "utils.h"
 
 // ==========================================
 // GLOBALS
